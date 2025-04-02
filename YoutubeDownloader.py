@@ -5,15 +5,17 @@ import concurrent.futures
 import glob
 import re
 import threading
+from pathlib import Path
 
 from pytubefix import Playlist
 from pytubefix.cli import on_progress
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QLineEdit, QComboBox, QPushButton, QTextEdit, QApplication
+    QWidget, QVBoxLayout, QLineEdit, QComboBox, QPushButton, QTextEdit, QApplication, QFileDialog
 )
-from pathlib import Path
+
+from plyer import notification
 
 # Dark theme style
 DARK_THEME = """
@@ -94,6 +96,9 @@ DARK_THEME = """
 def get_music_folder():
     return os.path.join(Path.home(), "Music")
 
+def get_download_folder():
+    return os.path.join(Path.home(), "Downloads")
+
 def sanitize_filename(name):
     # Remove characters that are unsafe for filenames.
     return re.sub(r'[\\/*?:"<>|]', "", name)
@@ -104,21 +109,17 @@ def download_and_convert(video, fmt, idx, total, log_callback, dir_path):
     Logs messages with the video title and its position (idx/total).
     """
     try:
-        # Compute the target file name using the sanitized video title.
         target_file = os.path.join(dir_path, f"{sanitize_filename(video.title)}.{fmt}")
         if os.path.exists(target_file):
             log_callback(f"skipped {video.title} {idx}/{total}")
             return
         else:
             log_callback(f"Downloading {video.title} {idx}/{total}")
-            # Get the audio-only stream and download it to the Songs directory.
             audio_stream = video.streams.get_audio_only()
             downloaded_file = audio_stream.download(output_path=dir_path)
-            
             # Use ffmpeg to convert the downloaded file to the desired format.
             command = ["ffmpeg", "-y", "-i", downloaded_file, target_file]
             subprocess.run(command, check=True)
-            
             # Remove the original temporary file.
             os.remove(downloaded_file)
             log_callback(f"Downloaded {video.title} {idx}/{total}")
@@ -128,11 +129,11 @@ def download_and_convert(video, fmt, idx, total, log_callback, dir_path):
 def download_playlist(url, fmt, log_callback, dir_path):
     print("Downloading playlist...")
     print(dir_path)
-    # Ensure the Songs directory exists.
+    # Ensure the destination directory exists.
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
     else:
-        # Delete all m4a files in the Songs directory.
+        # Delete all m4a files in the destination directory.
         for file in glob.glob(os.path.join(dir_path, "*.m4a")):
             try:
                 os.remove(file)
@@ -142,6 +143,7 @@ def download_playlist(url, fmt, log_callback, dir_path):
 
     log_callback("Loading playlist...")
     try:
+        global pl 
         pl = Playlist(url, use_oauth=True)
         videos = pl.videos
         total = len(videos)
@@ -165,6 +167,7 @@ class DownloaderWidget(QWidget):
 
     def __init__(self):
         super().__init__()
+        self.selected_directory = get_download_folder()
         self.init_ui()
         self.log_signal.connect(self.append_log)
         self.finished_signal.connect(self.on_finished)
@@ -182,6 +185,16 @@ class DownloaderWidget(QWidget):
         self.format_combo.addItems(["wav", "mp3"])
         layout.addWidget(self.format_combo)
         
+        # Directory display and Browse button.
+        self.destination_input = QLineEdit()
+        self.destination_input.setPlaceholderText("Choose destination folder")
+        self.destination_input.setText(self.selected_directory)
+        layout.addWidget(self.destination_input)
+        
+        self.browse_button = QPushButton("Browse...")
+        self.browse_button.clicked.connect(self.choose_destination)
+        layout.addWidget(self.browse_button)
+        
         # Button to start the download.
         self.download_button = QPushButton("Download Playlist")
         self.download_button.clicked.connect(self.start_download)
@@ -194,6 +207,13 @@ class DownloaderWidget(QWidget):
         
         self.setLayout(layout)
     
+    def choose_destination(self):
+        # Open a dialog to choose a directory. Defaults to the Music folder.
+        directory = QFileDialog.getExistingDirectory(self, "Select Download Folder", get_music_folder())
+        if directory:
+            self.destination_input.setText(directory)
+            self.selected_directory = directory
+
     def append_log(self, message):
         self.log_text.append(message)
     
@@ -208,11 +228,12 @@ class DownloaderWidget(QWidget):
             self.append_log("Invalid format selected. Defaulting to mp3.")
             fmt = "mp3"
         
-        # Disable button while downloading.
+        # Disable the download button while downloading.
         self.download_button.setEnabled(False)
         self.append_log("Starting download...")
 
-        dir_path = os.path.join(get_music_folder(), "YtSongs")
+        # Use the user-selected directory.
+        dir_path = self.destination_input.text()
         
         # Start the download in a background thread.
         thread = threading.Thread(target=self.download_thread, args=(url, fmt, dir_path))
@@ -227,6 +248,12 @@ class DownloaderWidget(QWidget):
     
     def on_finished(self):
         self.download_button.setEnabled(True)
+        notification.notify(
+            title="Download Done",
+            message=f"The playlist {pl.title} was succesfully downloaded.",
+            app_icon=None,  # You can specify an icon file (.ico on Windows)
+            timeout=20      # Duration in seconds
+            )
 
 def main():
     app = QApplication(sys.argv)
