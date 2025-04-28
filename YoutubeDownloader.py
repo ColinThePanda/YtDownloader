@@ -1,18 +1,26 @@
 import os
 import sys
 import subprocess
-import concurrent.futures
-import glob
-import re
+import multiprocessing
 import threading
+import re
 from pathlib import Path
 
-from pytubefix import Playlist
-from pytubefix.cli import on_progress
+import yt_dlp
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QLineEdit, QComboBox, QPushButton, QTextEdit, QApplication, QFileDialog
+    QWidget,
+    QVBoxLayout,
+    QLineEdit,
+    QComboBox,
+    QPushButton,
+    QTextEdit,
+    QApplication,
+    QFileDialog,
+    QSpinBox,
+    QLabel,
+    QHBoxLayout,
 )
 
 from plyer import notification
@@ -71,7 +79,7 @@ DARK_THEME = """
     QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
         background: transparent;
     }
-    QLineEdit, QComboBox, QTextEdit, QPushButton {
+    QLineEdit, QComboBox, QTextEdit, QPushButton, QSpinBox {
         background-color: #1a1a1a;
         color: #ffffff;
         border: 2px solid #2281c9;
@@ -93,77 +101,93 @@ DARK_THEME = """
     }
 """
 
+
 def get_music_folder():
     return os.path.join(Path.home(), "Music")
 
+
 def get_download_folder():
     return os.path.join(Path.home(), "Downloads")
+
 
 def sanitize_filename(name):
     # Remove characters that are unsafe for filenames.
     return re.sub(r'[\\/*?:"<>|]', "", name)
 
-def download_and_convert(video, fmt, idx, total, log_callback, dir_path):
+
+def download_video(args):
     """
-    Downloads and converts a video's audio stream.
-    Logs messages with the video title and its position (idx/total).
+    Downloads a video's audio stream using yt-dlp.
+    Args should be a tuple of (video_url, fmt, output_path, idx, total)
+    """
+    video_url, fmt, output_path, idx, total = args
+    
+    try:
+        # Configure yt-dlp options
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': os.path.join(output_path, '%(title)s.%(ext)s'),
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': fmt,
+                'preferredquality': '192',
+            }],
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        # Get info first to check if file exists
+        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            title = info.get('title', 'video')
+            sanitized_title = sanitize_filename(title)
+            target_file = os.path.join(output_path, f"{sanitized_title}.{fmt}")
+            
+            if os.path.exists(target_file):
+                return f"Skipped {title} {idx}/{total}"
+            
+            # Download the video
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
+                
+            return f"Downloaded {title} {idx}/{total}"
+    except Exception as e:
+        return f"Error processing {video_url} ({idx}/{total}): {e}"
+
+
+def get_playlist_videos(playlist_url):
+    """
+    Gets all video URLs from a playlist.
     """
     try:
-        target_file = os.path.join(dir_path, f"{sanitize_filename(video.title)}.{fmt}")
-        if os.path.exists(target_file):
-            log_callback(f"skipped {video.title} {idx}/{total}")
-            return
-        else:
-            log_callback(f"Downloading {video.title} {idx}/{total}")
-            audio_stream = video.streams.get_audio_only()
-            downloaded_file = audio_stream.download(output_path=dir_path)
-            # Use ffmpeg to convert the downloaded file to the desired format.
-            command = ["ffmpeg", "-y", "-i", downloaded_file, target_file]
-            subprocess.run(command, check=True)
-            # Remove the original temporary file.
-            os.remove(downloaded_file)
-            log_callback(f"Downloaded {video.title} {idx}/{total}")
+        # Configure yt-dlp options for playlist extraction
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True,  # Don't download videos, just get info
+            'ignoreerrors': True,  # Skip unavailable videos
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            playlist_info = ydl.extract_info(playlist_url, download=False)
+            
+            if 'entries' not in playlist_info:
+                return [], ""
+            
+            videos = []
+            for entry in playlist_info['entries']:
+                if entry:
+                    videos.append(f"https://www.youtube.com/watch?v={entry['id']}")
+            
+            playlist_title = playlist_info.get('title', 'YouTube Playlist')
+            return videos, playlist_title
     except Exception as e:
-        log_callback(f"Error processing {video.watch_url} ({idx}/{total}): {e}")
+        return [], ""
 
-def download_playlist(url, fmt, log_callback, dir_path):
-    print("Downloading playlist...")
-    print(dir_path)
-    # Ensure the destination directory exists.
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
-    else:
-        # Delete all m4a files in the destination directory.
-        for file in glob.glob(os.path.join(dir_path, "*.m4a")):
-            try:
-                os.remove(file)
-                log_callback(f"Deleted temporary file: {file}")
-            except Exception as e:
-                log_callback(f"Error deleting {file}: {e}")
-
-    log_callback("Loading playlist...")
-    try:
-        global pl 
-        pl = Playlist(url, use_oauth=True)
-        videos = pl.videos
-        total = len(videos)
-        log_callback(f"Found {total} videos in the playlist.")
-    except Exception as e:
-        log_callback(f"Error loading playlist: {e}")
-        return
-
-    # Process each video concurrently.
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [
-            executor.submit(download_and_convert, video, fmt, idx, total, log_callback, dir_path)
-            for idx, video in enumerate(videos, start=1)
-        ]
-        concurrent.futures.wait(futures)
-    log_callback("Download and conversion complete.")
 
 class DownloaderWidget(QWidget):
     log_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal()
+    finished_signal = pyqtSignal(str, int)
 
     def __init__(self):
         super().__init__()
@@ -171,52 +195,74 @@ class DownloaderWidget(QWidget):
         self.init_ui()
         self.log_signal.connect(self.append_log)
         self.finished_signal.connect(self.on_finished)
-    
+
     def init_ui(self):
         layout = QVBoxLayout()
-        
+
         # Input for the playlist URL.
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("Enter playlist URL")
         layout.addWidget(self.url_input)
+
+        # Format and processes selection
+        format_layout = QHBoxLayout()
         
         # Combo box to select desired format.
+        format_label = QLabel("Format:")
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["wav", "mp3"])
-        layout.addWidget(self.format_combo)
+        self.format_combo.addItems(["mp3", "wav", "m4a", "opus"])
+        format_layout.addWidget(format_label)
+        format_layout.addWidget(self.format_combo)
         
+        # Number of processes to use
+        processes_label = QLabel("Processes:")
+        self.processes_spin = QSpinBox()
+        self.processes_spin.setRange(1, multiprocessing.cpu_count())
+        self.processes_spin.setValue(min(8, multiprocessing.cpu_count()))
+        format_layout.addWidget(processes_label)
+        format_layout.addWidget(self.processes_spin)
+        
+        layout.addLayout(format_layout)
+
         # Directory display and Browse button.
+        dir_layout = QHBoxLayout()
         self.destination_input = QLineEdit()
         self.destination_input.setPlaceholderText("Choose destination folder")
         self.destination_input.setText(self.selected_directory)
-        layout.addWidget(self.destination_input)
-        
         self.browse_button = QPushButton("Browse...")
         self.browse_button.clicked.connect(self.choose_destination)
-        layout.addWidget(self.browse_button)
-        
+        dir_layout.addWidget(self.destination_input)
+        dir_layout.addWidget(self.browse_button)
+        layout.addLayout(dir_layout)
+
         # Button to start the download.
         self.download_button = QPushButton("Download Playlist")
         self.download_button.clicked.connect(self.start_download)
         layout.addWidget(self.download_button)
-        
+
         # Text area to display log messages.
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         layout.addWidget(self.log_text)
-        
+
         self.setLayout(layout)
-    
+
     def choose_destination(self):
         # Open a dialog to choose a directory. Defaults to the Music folder.
-        directory = QFileDialog.getExistingDirectory(self, "Select Download Folder", get_music_folder())
+        directory = QFileDialog.getExistingDirectory(
+            self, "Select Download Folder", get_music_folder()
+        )
         if directory:
             self.destination_input.setText(directory)
             self.selected_directory = directory
 
     def append_log(self, message):
         self.log_text.append(message)
-    
+        # Auto-scroll to the bottom
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(cursor.End)
+        self.log_text.setTextCursor(cursor)
+
     def start_download(self):
         url = self.url_input.text().strip()
         if not url:
@@ -224,10 +270,8 @@ class DownloaderWidget(QWidget):
             return
 
         fmt = self.format_combo.currentText().lower()
-        if fmt not in ["mp3", "wav"]:
-            self.append_log("Invalid format selected. Defaulting to mp3.")
-            fmt = "mp3"
-        
+        processes = self.processes_spin.value()
+
         # Disable the download button while downloading.
         self.download_button.setEnabled(False)
         self.append_log("Starting download...")
@@ -235,36 +279,78 @@ class DownloaderWidget(QWidget):
         # Use the user-selected directory.
         dir_path = self.destination_input.text()
         
+        # Ensure directory exists
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+
         # Start the download in a background thread.
-        thread = threading.Thread(target=self.download_thread, args=(url, fmt, dir_path))
+        thread = threading.Thread(
+            target=self.download_thread, args=(url, fmt, dir_path, processes)
+        )
+        thread.daemon = True
         thread.start()
-    
-    def download_thread(self, url, fmt, dir_path):
-        def log_callback(msg):
-            self.log_signal.emit(msg)
-        download_playlist(url, fmt, log_callback, dir_path)
+
+    def download_thread(self, url, fmt, dir_path, processes):
+        # Get videos from playlist
+        self.log_signal.emit("Loading playlist...")
+        videos, playlist_title = get_playlist_videos(url)
+        
+        if not videos:
+            self.log_signal.emit("No videos found in playlist.")
+            self.finished_signal.emit("", 0)
+            return
+        
+        total = len(videos)
+        self.log_signal.emit(f"Found {total} videos in playlist: {playlist_title}")
+        
+        # Prepare arguments for multiprocessing
+        args_list = [
+            (video_url, fmt, dir_path, idx, total)
+            for idx, video_url in enumerate(videos, start=1)
+        ]
+        
+        # Use multiprocessing to download videos
+        self.log_signal.emit(f"Starting download with {processes} processes...")
+        
+        with multiprocessing.Pool(processes=processes) as pool:
+            # Process results as they arrive
+            for result in pool.imap_unordered(download_video, args_list):
+                self.log_signal.emit(result)
+        
         self.log_signal.emit("Download thread finished.")
-        self.finished_signal.emit()
-    
-    def on_finished(self):
+        self.finished_signal.emit(playlist_title, total)
+
+    def on_finished(self, playlist_title, total_videos):
         self.download_button.setEnabled(True)
-        notification.notify(
-            title="Download Done",
-            message=f"The playlist {pl.title} was succesfully downloaded.",
-            app_icon=None,  # You can specify an icon file (.ico on Windows)
-            timeout=20      # Duration in seconds
+        if playlist_title and total_videos > 0:
+            notification.notify(
+                title="Download Complete",
+                message=f"The playlist '{playlist_title}' with {total_videos} videos was successfully downloaded.",
+                timeout=20,  # Duration in seconds
+            )
+        else:
+            notification.notify(
+                title="Download Failed",
+                message="Failed to download playlist. Check log for details.",
+                timeout=20,
             )
 
+
 def main():
+    # Required for multiprocessing to work properly on Windows
+    if sys.platform.startswith('win'):
+        multiprocessing.freeze_support()
+    
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_THEME)
-    
+
     window = DownloaderWidget()
     window.setWindowTitle("YouTube Playlist Downloader")
     window.resize(600, 400)
     window.show()
-    
+
     sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
     main()
